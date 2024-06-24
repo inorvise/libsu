@@ -6,5 +6,6 @@ package com.topjohnwu.libsuexample;
 interface ITestService {
     int getPid();
     int getUid();
-    String readCmdline();
+    String getUUID();
+    IBinder getFileSystemService();
 }

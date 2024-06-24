@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -100,7 +100,7 @@ public final class ShellUtils {
      * @return {@code true} if the current thread is the main thread.
      */
     public static boolean onMainThread() {
-        return ((Looper.myLooper() != null) && (Looper.myLooper() == Looper.getMainLooper()));
+        return Looper.getMainLooper().getThread() == Thread.currentThread();
     }
 
     /**
@@ -114,6 +114,8 @@ public final class ShellUtils {
         } catch (IOException ignored) {}
     }
 
+    private static final char SINGLE_QUOTE = '\'';
+
     /**
      * Format string to quoted and escaped string suitable for shell commands.
      * @param s the string to be formatted.
@@ -121,15 +123,17 @@ public final class ShellUtils {
      */
     public static String escapedString(String s) {
         StringBuilder sb = new StringBuilder();
-        sb.append('"');
+        sb.append(SINGLE_QUOTE);
         int len = s.length();
         for (int i = 0; i < len; ++i) {
             char c = s.charAt(i);
-            if ("$`\"\\".indexOf(c) >= 0)
-                sb.append('\\');
+            if (c == SINGLE_QUOTE) {
+                sb.append("'\\''");
+                continue;
+            }
             sb.append(c);
         }
-        sb.append('"');
+        sb.append(SINGLE_QUOTE);
         return sb.toString();
     }
 

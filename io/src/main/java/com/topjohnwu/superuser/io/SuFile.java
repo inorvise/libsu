@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,24 @@
 
 package com.topjohnwu.superuser.io;
 
+import static com.topjohnwu.superuser.ShellUtils.escapedString;
+
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ShellUtils;
+import com.topjohnwu.superuser.internal.IOFactory;
+import com.topjohnwu.superuser.internal.Utils;
+import com.topjohnwu.superuser.nio.ExtendedFile;
+import com.topjohnwu.superuser.nio.FileSystemManager;
 
 import java.io.File;
 import java.io.FileFilter;
 import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
@@ -45,37 +54,43 @@ import java.util.Locale;
  * <p>
  * Each method description in this class will list out its required commands.
  * The following commands exist on all Android versions: {@code rm}, {@code rmdir},
- * {@code mv}, {@code ls}, and {@code mkdir}.
+ * {@code mv}, {@code ls}, {@code ln}, and {@code mkdir}.
  * The following commands require {@code toybox} on Android 6.0 and higher, or {@code busybox}
  * to support legacy devices: {@code readlink}, {@code touch}, and {@code stat}.
  * <p>
- * This class has handy factory methods {@code SuFile.open(...)} for obtaining {@link File}
+ * This class has a few factory methods {@code SuFile.open(...)} for obtaining {@link File}
  * instances. These factory methods will return a normal {@link File} instance if the main
- * shell does not have root access, or else return a {@link SuFile} instance.
+ * shell does not have root access, or else return a {@link SuFile} instance. Warning: these
+ * factory methods may block the calling thread if a main shell has not been created yet!
  */
-public class SuFile extends File {
+public class SuFile extends ExtendedFile {
 
     private final String escapedPath;
+    private Shell mShell;
 
-    public static File open(String pathname) {
-        return Shell.rootAccess() ? new SuFile(pathname) : new File(pathname);
+    public static ExtendedFile open(String pathname) {
+        return Utils.isMainShellRoot() ? new SuFile(pathname) :
+                FileSystemManager.getLocal().getFile(pathname);
     }
 
-    public static File open(String parent, String child) {
-        return Shell.rootAccess() ? new SuFile(parent, child) : new File(parent, child);
+    public static ExtendedFile open(String parent, String child) {
+        return Utils.isMainShellRoot() ? new SuFile(parent, child) :
+                FileSystemManager.getLocal().getFile(parent, child);
     }
 
-    public static File open(File parent, String child) {
-        return Shell.rootAccess() ? new SuFile(parent, child) : new File(parent, child);
+    public static ExtendedFile open(File parent, String child) {
+        return Utils.isMainShellRoot() ? new SuFile(parent, child) :
+                FileSystemManager.getLocal().getFile(parent.getPath(), child);
     }
 
-    public static File open(URI uri) {
-        return Shell.rootAccess() ? new SuFile(uri) : new File(uri);
+    public static ExtendedFile open(URI uri) {
+        return Utils.isMainShellRoot() ? new SuFile(uri) :
+                FileSystemManager.getLocal().getFile(new File(uri).getPath());
     }
 
     SuFile(@NonNull File file) {
         super(file.getAbsolutePath());
-        escapedPath = ShellUtils.escapedString(getPath());
+        escapedPath = escapedString(getPath());
     }
 
     public SuFile(String pathname) {
@@ -94,14 +109,41 @@ public class SuFile extends File {
         this(new File(uri));
     }
 
+    private SuFile create(String path) {
+        SuFile s = new SuFile(path);
+        s.mShell = mShell;
+        return s;
+    }
+
+    @NonNull
+    @Override
+    public SuFile getChildFile(String name) {
+        SuFile s = new SuFile(this, name);
+        s.mShell = mShell;
+        return s;
+    }
+
     private String cmd(String c) {
         // Use replace instead of format for performance
-        return ShellUtils.fastCmd(c.replace("@@", escapedPath));
+        return ShellUtils.fastCmd(getShell(), c.replace("@@", escapedPath));
     }
 
     private boolean cmdBool(String c) {
         // Use replace instead of format for performance
-        return ShellUtils.fastCmdResult(c.replace("@@", escapedPath));
+        return ShellUtils.fastCmdResult(getShell(), c.replace("@@", escapedPath));
+    }
+
+    /**
+     * Set the {@code Shell} instance to be used internally for all operations.
+     * This shell is also used in {@link SuFileInputStream}, {@link SuFileOutputStream}, and
+     * {@link SuRandomAccessFile}.
+     */
+    public void setShell(Shell shell) {
+        mShell = shell;
+    }
+
+    public Shell getShell() {
+        return mShell == null ? Shell.getShell() : mShell;
     }
 
     /**
@@ -132,6 +174,36 @@ public class SuFile extends File {
     @Override
     public boolean createNewFile() {
         return cmdBool("[ ! -e @@ ] && echo -n > @@");
+    }
+
+    /**
+     * Creates a new hard link named by this abstract pathname of an existing file
+     * if and only if a file with this name does not yet exist.
+     * <p>
+     * Requires command {@code ln}.
+     * @param existing a path to an existing file.
+     * @return <code>true</code> if the named file does not exist and was successfully
+     *         created; <code>false</code> if the creation failed.
+     */
+    @Override
+    public boolean createNewLink(String existing) {
+        existing = ShellUtils.escapedString(existing);
+        return cmdBool("[ ! -d " + existing + " ] && ln @@ " + existing);
+    }
+
+    /**
+     * Creates a new symbolic link named by this abstract pathname to a target file
+     * if and only if a file with this name does not yet exist.
+     * <p>
+     * Requires command {@code ln}.
+     * @param target the target of the symbolic link.
+     * @return <code>true</code> if the named file does not exist and was successfully
+     *         created; <code>false</code> if the creation failed.
+     */
+    @Override
+    public boolean createNewSymlink(String target) {
+        target = ShellUtils.escapedString(target);
+        return cmdBool("[ ! -d " + target + " ] && ln -s @@ " + target);
     }
 
     /**
@@ -216,13 +288,13 @@ public class SuFile extends File {
     @NonNull
     @Override
     public SuFile getCanonicalFile() {
-        return new SuFile(getCanonicalPath());
+        return create(getCanonicalPath());
     }
 
     @Override
     public SuFile getParentFile() {
         String parent = getParent();
-        return parent == null ? null : new SuFile(parent);
+        return parent == null ? null : create(parent);
     }
 
     private long statFS(String fmt) {
@@ -281,24 +353,43 @@ public class SuFile extends File {
     }
 
     /**
-     * @return true if the abstract pathname denotes a block device.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isBlock() {
         return cmdBool("[ -b @@ ]");
     }
 
     /**
-     * @return true if the abstract pathname denotes a character device.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isCharacter() {
         return cmdBool("[ -c @@ ]");
     }
 
     /**
-     * @return true if the abstract pathname denotes a symbolic link file.
+     * {@inheritDoc}
      */
+    @Override
     public boolean isSymlink() {
         return cmdBool("[ -L @@ ]");
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isNamedPipe() {
+        return cmdBool("[ -p @@ ]");
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isSocket() {
+        return cmdBool("[ -S @@ ]");
     }
 
     /**
@@ -362,8 +453,8 @@ public class SuFile extends File {
      */
     @Override
     public boolean renameTo(File dest) {
-        String cmd = "mv -f " + escapedPath + " " + ShellUtils.escapedString(dest.getAbsolutePath());
-        return ShellUtils.fastCmdResult(cmd);
+        String cmd = "mv -f " + escapedPath + " " + escapedString(dest.getAbsolutePath());
+        return ShellUtils.fastCmdResult(getShell(), cmd);
     }
 
     private boolean setPerms(boolean set, boolean ownerOnly, int b) {
@@ -471,7 +562,8 @@ public class SuFile extends File {
         if (!isDirectory())
             return null;
         String cmd = "ls -a " + escapedPath;
-        List<String> out = Shell.su(cmd).to(new LinkedList<>(), null).exec().getOut();
+        List<String> out = getShell().newJob().add(cmd)
+                .to(new LinkedList<>(), null).exec().getOut();
         for (ListIterator<String> it = out.listIterator(); it.hasNext();) {
             String name = it.next();
             if (name.equals(".") || name.equals("..") ||
@@ -495,11 +587,12 @@ public class SuFile extends File {
         if (!isDirectory())
             return null;
         String[] ss = list();
-        if (ss == null) return null;
+        if (ss == null)
+            return null;
         int n = ss.length;
         SuFile[] fs = new SuFile[n];
         for (int i = 0; i < n; i++) {
-            fs[i] = new SuFile(this, ss[i]);
+            fs[i] = getChildFile(ss[i]);
         }
         return fs;
     }
@@ -517,11 +610,12 @@ public class SuFile extends File {
         if (!isDirectory())
             return null;
         String[] ss = list(filter);
-        if (ss == null) return null;
+        if (ss == null)
+            return null;
         int n = ss.length;
         SuFile[] fs = new SuFile[n];
         for (int i = 0; i < n; i++) {
-            fs[i] = new SuFile(this, ss[i]);
+            fs[i] = getChildFile(ss[i]);
         }
         return fs;
     }
@@ -537,13 +631,26 @@ public class SuFile extends File {
     @Override
     public SuFile[] listFiles(FileFilter filter) {
         String[] ss = list();
-        if (ss == null) return null;
+        if (ss == null)
+            return null;
         ArrayList<SuFile> files = new ArrayList<>();
         for (String s : ss) {
-            SuFile f = new SuFile(this, s);
+            SuFile f = getChildFile(s);
             if ((filter == null) || filter.accept(f))
                 files.add(f);
         }
         return files.toArray(new SuFile[0]);
+    }
+
+    @NonNull
+    @Override
+    public InputStream newInputStream() throws IOException {
+        return IOFactory.fifoIn(this);
+    }
+
+    @NonNull
+    @Override
+    public OutputStream newOutputStream(boolean append) throws IOException {
+        return IOFactory.fifoOut(this, append);
     }
 }

@@ -24,15 +24,13 @@
 -assumenosideeffects class com.topjohnwu.superuser.internal.Utils {
 	public static void log(...);
 	public static void ex(...);
-}
--assumevalues class com.topjohnwu.superuser.internal.Utils {
 	public static boolean vLog() return false;
+	public static boolean hasStartupAgents(android.content.Context) return false;
 }
--assumevalues class android.os.Debug {
+-assumenosideeffects class android.os.Debug {
 	public static boolean isDebuggerConnected() return false;
 }
 
 # Make sure R8/Proguard don't break things
 -keep,allowobfuscation class * extends com.topjohnwu.superuser.Shell$Initializer { *; }
--keep,allowobfuscation class com.topjohnwu.superuser.ipc.IPCServer { *; }
 -keep,allowobfuscation class * extends com.topjohnwu.superuser.ipc.RootService { *; }

@@ -1,65 +1,56 @@
 import com.android.build.gradle.BaseExtension
+import com.android.build.gradle.LibraryExtension
+import java.io.ByteArrayOutputStream
 import java.net.URL
 
-// Top-level build file where you can add configuration options common to all sub-projects/modules.
 plugins {
-    id("maven-publish")
     id("java")
-}
-
-buildscript {
-    repositories {
-        google()
-        jcenter()
-    }
-
-    dependencies {
-        classpath("com.android.tools.build:gradle:4.1.3")
-        classpath("com.github.dcendents:android-maven-gradle-plugin:2.1")
-
-        // NOTE: Do not place your application dependencies here; they belong
-        // in the individual module build.gradle files
-    }
+    id("maven-publish")
+    id("com.android.library") version "8.5.0" apply false
 }
 
 val dlPackageList by tasks.registering {
     outputs.upToDateWhen { false }
     doLast {
-        /* Merge framework packages with AndroidX packages into the same list
-        * so links to Android classes can work properly in Javadoc */
-        rootProject.buildDir.mkdirs()
-        File(rootProject.buildDir, "package-list").outputStream().use { out ->
-            URL("https://developer.android.com/reference/package-list")
-                .openStream().use { src -> src.copyTo(out) }
-            URL("https://developer.android.com/reference/androidx/package-list")
-                .openStream().use { src -> src.copyTo(out) }
+        // Merge framework packages with AndroidX packages into the same list
+        // so links to Android classes can work properly in Javadoc
+
+        val bos = ByteArrayOutputStream()
+        URL("https://developer.android.com/reference/package-list")
+                .openStream().use { src -> src.copyTo(bos) }
+        URL("https://developer.android.com/reference/androidx/package-list")
+                .openStream().use { src -> src.copyTo(bos) }
+
+        // Strip out empty lines
+        val packageList = bos.toString("UTF-8").replace("\n+".toRegex(), "\n")
+
+        rootProject.layout.buildDirectory.asFile.get().mkdirs()
+        rootProject.layout.buildDirectory.file("package-list").get().asFile.outputStream().use {
+            it.writer().write(packageList)
+            it.write("\n".toByteArray())
         }
     }
 }
 
-val javadoc = tasks.replace("javadoc", Javadoc::class).apply {
+val javadoc = (tasks["javadoc"] as Javadoc).apply {
     dependsOn(dlPackageList)
     isFailOnError = false
     title = "libsu API"
     exclude("**/internal/**")
     (options as StandardJavadocDocletOptions).apply {
-        links = listOf("https://docs.oracle.com/javase/8/docs/api/")
         linksOffline = listOf(JavadocOfflineLink(
-            "https://developer.android.com/reference/", rootProject.buildDir.path))
+            "https://developer.android.com/reference/",
+            rootProject.layout.buildDirectory.asFile.get().path))
         isNoDeprecated = true
+        addBooleanOption("-ignore-source-errors").value = true
     }
-    setDestinationDir(File(rootProject.buildDir, "javadoc"))
+    setDestinationDir(rootProject.layout.buildDirectory.dir("javadoc").get().asFile)
 }
 
 val javadocJar by tasks.registering(Jar::class) {
     dependsOn(javadoc)
     archiveClassifier.set("javadoc")
     from(javadoc.destinationDir)
-}
-
-/* Force JitPack to build javadocJar and publish */
-tasks.register("install") {
-    dependsOn(tasks["publishToMavenLocal"])
 }
 
 publishing {
@@ -72,32 +63,23 @@ publishing {
     }
 }
 
-val Project.android get() = extensions.getByName<BaseExtension>("android")
+fun Project.android(configuration: BaseExtension.() -> Unit) =
+        extensions.getByName<BaseExtension>("android").configuration()
+
+fun Project.androidLibrary(configuration: LibraryExtension.() -> Unit) =
+        extensions.getByName<LibraryExtension>("android").configuration()
 
 subprojects {
-    buildscript {
-        repositories {
-            google()
-            jcenter()
-        }
-    }
-
-    repositories {
-        google()
-        jcenter()
-    }
-
     configurations.create("javadocDeps")
-
     afterEvaluate {
-        android.apply {
-            compileSdkVersion(30)
-            buildToolsVersion = "30.0.3"
+        android {
+            compileSdkVersion(34)
+            buildToolsVersion = "34.0.0"
 
             defaultConfig {
                 if (minSdkVersion == null)
-                    minSdkVersion(14)
-                targetSdkVersion(30)
+                    minSdk = 19
+                targetSdk = 34
             }
 
             compileOptions {
@@ -107,29 +89,39 @@ subprojects {
         }
 
         if (plugins.hasPlugin("com.android.library")) {
-            android.apply {
-                buildFeatures.apply {
+            apply(plugin = "maven-publish")
+
+            androidLibrary {
+                buildFeatures {
                     buildConfig = false
                 }
+
+                val sources = sourceSets.getByName("main").java.getSourceFiles()
+
+                javadoc.apply {
+                    source += sources
+                    classpath += project.files(bootClasspath)
+                    classpath += configurations.getByName("javadocDeps")
+                }
+
+                publishing {
+                    singleVariant("release") {
+                        withSourcesJar()
+                        withJavadocJar()
+                    }
+                }
             }
-        }
 
-        if (plugins.hasPlugin("com.github.dcendents.android-maven")) {
-            val sources = android.sourceSets.getByName("main").java.getSourceFiles()
-
-            (rootProject.tasks["javadoc"] as Javadoc).apply {
-                source += sources
-                classpath += project.files(android.bootClasspath)
-                classpath += configurations.getByName("javadocDeps")
-            }
-
-            val sourcesJar = tasks.register("sourcesJar", Jar::class) {
-                archiveClassifier.set("sources")
-                from(sources)
-            }
-
-            artifacts {
-                add("archives", sourcesJar)
+            publishing {
+                publications {
+                    register<MavenPublication>("libsu") {
+                        afterEvaluate {
+                            from(components["release"])
+                        }
+                        groupId = "com.github.topjohnwu.libsu"
+                        artifactId = project.name
+                    }
+                }
             }
         }
     }

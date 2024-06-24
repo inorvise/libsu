@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package com.topjohnwu.superuser.internal;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import androidx.annotation.NonNull;
 
 import java.io.ByteArrayInputStream;
@@ -23,8 +25,6 @@ import java.io.DataInput;
 import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.IOException;
-
-import static com.topjohnwu.superuser.internal.Utils.UTF_8;
 
 interface DataInputImpl extends DataInput {
 

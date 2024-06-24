@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,14 +34,13 @@ import android.widget.ScrollView;
 import androidx.annotation.NonNull;
 
 import com.topjohnwu.libsuexample.databinding.ActivityMainBinding;
-import com.topjohnwu.superuser.BusyBoxInstaller;
 import com.topjohnwu.superuser.CallbackList;
 import com.topjohnwu.superuser.Shell;
 import com.topjohnwu.superuser.ipc.RootService;
+import com.topjohnwu.superuser.nio.FileSystemManager;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.Arrays;
 import java.util.List;
 
 public class MainActivity extends Activity implements Handler.Callback {
@@ -52,20 +51,14 @@ public class MainActivity extends Activity implements Handler.Callback {
         Shell.enableVerboseLogging = BuildConfig.DEBUG;
         Shell.setDefaultBuilder(Shell.Builder.create()
                 .setFlags(Shell.FLAG_REDIRECT_STDERR)
-                // BusyBoxInstaller should come first!
-                .setInitializers(BusyBoxInstaller.class, ExampleInitializer.class)
+                .setInitializers(ExampleInitializer.class)
         );
     }
 
-    private ITestService testIPC;
-    private Messenger remoteMessenger;
-    private Messenger myMessenger = new Messenger(new Handler(Looper.getMainLooper(), this));
-    private MSGConnection conn = new MSGConnection();
-    private boolean daemonTestQueued = false;
-    private boolean serviceTestQueued = false;
+    private final Messenger me = new Messenger(new Handler(Looper.getMainLooper(), this));
+    private final List<String> consoleList = new AppendCallbackList();
 
     private ActivityMainBinding binding;
-    private List<String> consoleList = new AppendCallbackList();
 
     // Demonstrate Shell.Initializer
     static class ExampleInitializer extends Shell.Initializer {
@@ -79,82 +72,117 @@ public class MainActivity extends Activity implements Handler.Callback {
         }
     }
 
+    private AIDLConnection aidlConn;
+    private AIDLConnection daemonConn;
+    private FileSystemManager remoteFS;
+
     class AIDLConnection implements ServiceConnection {
+
+        private final boolean isDaemon;
+
+        AIDLConnection(boolean b) {
+            isDaemon = b;
+        }
+
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
-            Log.d(TAG, "daemon onServiceConnected");
-            testIPC = ITestService.Stub.asInterface(service);
-            if (daemonTestQueued) {
-                daemonTestQueued = false;
-                testDaemon();
+            Log.d(TAG, "AIDL onServiceConnected");
+            if (isDaemon) {
+                daemonConn = this;
+            } else {
+                aidlConn = this;
             }
+
+            ITestService ipc = ITestService.Stub.asInterface(service);
+            try {
+                consoleList.add("AIDL PID : " + ipc.getPid());
+                consoleList.add("AIDL UID : " + ipc.getUid());
+                consoleList.add("AIDL UUID: " + ipc.getUUID());
+                if (!isDaemon) {
+                    // Get the remote file system service proxy through AIDL
+                    IBinder binder = ipc.getFileSystemService();
+                    // Create a fs manager with the binder proxy.
+                    // We will use this fs manager in our stress test.
+                    remoteFS = FileSystemManager.getRemote(binder);
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "Remote error", e);
+            }
+            refreshUI();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            Log.d(TAG, "daemon onServiceDisconnected");
-            testIPC = null;
+            Log.d(TAG, "AIDL onServiceDisconnected");
+            if (isDaemon) {
+                daemonConn = null;
+            } else {
+                aidlConn = null;
+                remoteFS = null;
+            }
+            refreshUI();
         }
     }
+
+    private MSGConnection msgConn;
 
     class MSGConnection implements ServiceConnection {
 
+        private Messenger m;
+
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
-            Log.d(TAG, "service onServiceConnected");
-            remoteMessenger = new Messenger(service);
-            if (serviceTestQueued) {
-                serviceTestQueued = false;
-                testService();
+            Log.d(TAG, "MSG onServiceConnected");
+            m = new Messenger(service);
+            msgConn = this;
+            refreshUI();
+
+            Message msg = Message.obtain(null, MSGService.MSG_GETINFO);
+            msg.replyTo = me;
+            try {
+                m.send(msg);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Remote error", e);
+            } finally {
+                msg.recycle();
             }
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            Log.d(TAG, "service onServiceDisconnected");
-            remoteMessenger = null;
+            Log.d(TAG, "MSG onServiceDisconnected");
+            msgConn = null;
+            refreshUI();
         }
-    }
 
-    private void testDaemon() {
-        try {
-            consoleList.add("Daemon PID: " + testIPC.getPid());
-            consoleList.add("Daemon UID: " + testIPC.getUid());
-            String[] cmds = testIPC.readCmdline().split(" ");
-            if (cmds.length > 5) {
-                cmds = Arrays.copyOf(cmds, 6);
-                cmds[5] = "...";
+        void stop() {
+            if (m == null)
+                return;
+            Message msg = Message.obtain(null, MSGService.MSG_STOP);
+            try {
+                m.send(msg);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Remote error", e);
+            } finally {
+                msg.recycle();
             }
-            consoleList.add("/proc/cmdline:");
-            consoleList.addAll(Arrays.asList(cmds));
-        } catch (RemoteException e) {
-            Log.e(TAG, "Remote error", e);
-        }
-    }
-
-    private void testService() {
-        Message message = Message.obtain(null, MSGService.MSG_GETINFO);
-        message.replyTo = myMessenger;
-        try {
-            remoteMessenger.send(message);
-        } catch (RemoteException e) {
-            Log.e(TAG, "Remote error", e);
         }
     }
 
     @Override
     public boolean handleMessage(@NonNull Message msg) {
-        consoleList.add("Remote PID: " + msg.arg1);
-        consoleList.add("Remote UID: " + msg.arg2);
-        String cmdline = msg.getData().getString(MSGService.CMDLINE_KEY);
-        String[] cmds = cmdline.split(" ");
-        if (cmds.length > 5) {
-            cmds = Arrays.copyOf(cmds, 6);
-            cmds[5] = "...";
-        }
-        consoleList.add("/proc/cmdline:");
-        consoleList.addAll(Arrays.asList(cmds));
+        consoleList.add("MSG PID  : " + msg.arg1);
+        consoleList.add("MSG UID  : " + msg.arg2);
+        String uuid = msg.getData().getString(MSGService.UUID_KEY);
+        consoleList.add("MSG UUID : " + uuid);
         return false;
+    }
+
+    private void refreshUI() {
+        binding.aidlSvc.setText(aidlConn == null ? "Bind AIDL" : "Unbind AIDL");
+        binding.msgSvc.setText(msgConn == null ? "Bind MSG" : "Unbind MSG");
+        binding.testDaemon.setText(daemonConn == null ? "Bind Daemon" : "Unbind Daemon");
+        binding.stressTest.setEnabled(remoteFS != null);
     }
 
     @Override
@@ -163,36 +191,54 @@ public class MainActivity extends Activity implements Handler.Callback {
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
 
-        binding.testSvc.setOnClickListener(v -> {
-            if (remoteMessenger == null) {
-                serviceTestQueued = true;
-                Intent intent = new Intent(this, MSGService.class);
-                RootService.bind(intent, conn);
-                return;
-            }
-            testService();
-        });
-
-        binding.unbindSvc.setOnClickListener(v -> RootService.unbind(conn));
-
-        binding.testDaemon.setOnClickListener(v -> {
-            if (testIPC == null) {
-                daemonTestQueued = true;
+        // Bind to a root service; IPC via AIDL
+        binding.aidlSvc.setOnClickListener(v -> {
+            if (aidlConn == null) {
                 Intent intent = new Intent(this, AIDLService.class);
-                RootService.bind(intent, new AIDLConnection());
-                return;
+                RootService.bind(intent, new AIDLConnection(false));
+            } else {
+                RootService.unbind(aidlConn);
             }
-            testDaemon();
         });
 
+        // Bind to a root service; IPC via Messages
+        binding.msgSvc.setOnClickListener(v -> {
+            if (msgConn == null) {
+                Intent intent = new Intent(this, MSGService.class);
+                RootService.bind(intent, new MSGConnection());
+            } else {
+                RootService.unbind(msgConn);
+            }
+        });
+
+        // Send a message to service and ask it to stop itself to test stopSelf()
+        binding.selfStop.setOnClickListener(v -> {
+            if (msgConn != null) {
+                msgConn.stop();
+            }
+        });
+
+        // To verify whether the daemon actually works, kill the app and try testing the
+        // daemon again. You should get the same PID as last time (as it was re-using the
+        // previous daemon process), and in AIDLService, onRebind should be called.
+        // Note: re-running the app in Android Studio is not the same as kill + relaunch.
+        // The root process will kill itself when it detects the client APK has updated.
+
+        // Bind to a daemon root service
+        binding.testDaemon.setOnClickListener(v -> {
+            if (daemonConn == null) {
+                Intent intent = new Intent(this, AIDLService.class);
+                intent.addCategory(RootService.CATEGORY_DAEMON_MODE);
+                RootService.bind(intent, new AIDLConnection(true));
+            } else {
+                RootService.unbind(daemonConn);
+            }
+        });
+
+        // Test the stop API
         binding.stopDaemon.setOnClickListener(v -> {
             Intent intent = new Intent(this, AIDLService.class);
-            // Use stop here instead of unbind because AIDLService is running as a daemon.
-            // To verify whether the daemon actually works, kill the app and try testing the
-            // daemon again. You should get the same PID as last time (as it was re-using the
-            // previous daemon process), and in AIDLService, onRebind should be called.
-            // Note: re-running the app in Android Studio is not the same as kill + relaunch.
-            // The root service will kill itself when it detects the client APK has updated.
+            intent.addCategory(RootService.CATEGORY_DAEMON_MODE);
             RootService.stop(intent);
         });
 
@@ -209,15 +255,15 @@ public class MainActivity extends Activity implements Handler.Callback {
 
         // test_sync is defined in R.raw.bashrc, pre-loaded in ExampleInitializer
         binding.testSync.setOnClickListener(v ->
-                Shell.sh("test_sync").to(consoleList).exec());
+                Shell.cmd("test_sync").to(consoleList).exec());
 
         // test_async is defined in R.raw.bashrc, pre-loaded in ExampleInitializer
         binding.testAsync.setOnClickListener(v ->
-                Shell.sh("test_async").to(consoleList).submit());
+                Shell.cmd("test_async").to(consoleList).submit());
 
         binding.clear.setOnClickListener(v -> binding.console.setText(""));
 
-        binding.stressTest.setOnClickListener(v -> StressTest.perform(consoleList));
+        binding.stressTest.setOnClickListener(v -> StressTest.perform(remoteFS));
     }
 
     /**

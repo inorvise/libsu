@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,12 +64,6 @@ class ShellBlockIO extends ShellIO {
         if (fileOff + len > blockSize)
             throw new IOException("Cannot write pass block size");
         super.write(b, off, len);
-    }
-
-    @Override
-    void streamWrite(byte[] b, int off, int len) throws IOException {
-        // Block devices cannot use append
-        write(b, off, len);
     }
 
     @Override

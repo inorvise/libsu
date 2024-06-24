@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 John "topjohnwu" Wu
+ * Copyright 2023 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,38 +16,65 @@
 
 package com.topjohnwu.libsuexample;
 
-import android.os.Build;
+import static com.topjohnwu.libsuexample.MainActivity.TAG;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_READ_ONLY;
+import static com.topjohnwu.superuser.nio.FileSystemManager.MODE_WRITE_ONLY;
+
 import android.util.Log;
 
 import com.topjohnwu.superuser.Shell;
-import com.topjohnwu.superuser.internal.IOFactory;
 import com.topjohnwu.superuser.io.SuFile;
+import com.topjohnwu.superuser.io.SuRandomAccessFile;
+import com.topjohnwu.superuser.nio.ExtendedFile;
+import com.topjohnwu.superuser.nio.FileSystemManager;
 
-import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.List;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Random;
-
-import static com.topjohnwu.libsuexample.MainActivity.TAG;
 
 public class StressTest {
 
-    private static List<String> console;
-    private static OutputStream out;
-    private static FileCallback callback;
-    private static final byte[] buf = new byte[64 * 1024];
-
     interface FileCallback {
-        void onFile(SuFile file) throws Exception;
+        void onFile(ExtendedFile file) throws Exception;
     }
 
-    public static void perform(List<String> c) {
-        console = c;
+    private static final String TEST_DIR= "/system/app";
+    private static final int BUFFER_SIZE = 512 * 1024;
+    private static final Random r = new Random();
+    private static final MessageDigest md;
+
+    static {
+        MessageDigest m;
+        try {
+            m = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            m = null;
+        }
+        md = m;
+    }
+
+    private static FileSystemManager remoteFS;
+    private static FileCallback callback;
+    private static Map<String, byte[]> hashes;
+
+    public static void perform(FileSystemManager fs) {
+        remoteFS = fs;
         Shell.EXECUTOR.execute(() -> {
             try {
-                run();
+                collectHashes();
+                // Test I/O streams
+                testShellStream();
+                testRemoteStream();
+                // Test random I/O
+                testShellRandomIO();
+                testRemoteChannel();
             } catch (Exception e){
                 Log.d(TAG, "", e);
             } finally {
@@ -58,95 +85,152 @@ public class StressTest {
 
     public static void cancel() {
         // These shall force tons of exceptions and cancel the thread :)
-        console = null;
         callback = null;
-        if (out != null) {
-            try { out.close(); } catch (IOException ignored) {}
-            out = null;
-        }
+        remoteFS = null;
+        hashes = null;
     }
 
-    private static void run() throws Exception {
-        // Change to a more reasonable path if you don't want the
-        // stress test to run forever
-        SuFile root = new SuFile("/system");
+    private static void collectHashes() throws Exception {
+        FileSystemManager fs = FileSystemManager.getLocal();
+        ExtendedFile root = fs.getFile(TEST_DIR);
 
-        // This will stress test excessive root commands as SuFile runs
-        // a bunch of them in a short period of time
+        // Collect checksums of all files in test dir and use it as a reference
+        // to verify the correctness of the several I/O implementations.
+        Map<String, byte[]> map = new HashMap<>();
+        byte[] buf = new byte[BUFFER_SIZE];
         callback = file -> {
-            file.isCharacter();
-            file.isBlock();
-            file.isSymlink();
-        };
-        traverse(root);
-
-        if (Build.VERSION.SDK_INT >= 21) {
-            // Stress test FifoOutputStream
-            out = IOFactory.fifoOut(new SuFile("/dev/null"), false);
-
-            // Make sure FifoInputStream works fine
-            callback = file -> {
-                try (InputStream in = IOFactory.fifoIn(file)) {
-                    pump(in);
+            try (InputStream in = file.newInputStream()) {
+                for (;;) {
+                    int read = in.read(buf);
+                    if (read <= 0)
+                        break;
+                    md.update(buf, 0, read);
                 }
-            };
-            traverse(root);
-        } else {
-            // Unfortunately, ShellOutputStream will crash BusyBox ASH :(
-            // This means pre API 21, we cannot properly test root
-            // outputs as CopyOutputStream does not actually pump data
-            // directly to the target file.
-
-            // In my personal environments, removing the BusyBoxInstaller
-            // from shell initializers allows ShellOutputStream to operate
-            // without issues, however due to these reasons, shell I/O
-            // is strongly advised against.
-
-            // /dev/null is writable without root
-            out = new FileOutputStream("/dev/null");
-        }
-
-        // Make sure CopyInputStream works fine
-        callback = file -> {
-            try (InputStream in = IOFactory.copyIn(file)) {
-                pump(in);
             }
+            map.put(file.getPath(), md.digest());
         };
         traverse(root);
-
-        // Make sure ShellInputStream works fine
-        callback = file -> {
-            try (InputStream in = IOFactory.shellIn(file)) {
-                pump(in);
-            }
-        };
-        traverse(root);
+        hashes = map;
     }
 
-    private static void traverse(SuFile base) throws Exception {
-        console.add(base.getPath());
-        if (base.isDirectory()) {
-            SuFile[] ls = base.listFiles();
+    private static void testShellStream() throws Exception {
+        SuFile root = new SuFile(TEST_DIR);
+        SuFile outFile = new SuFile("/dev/null");
+        testIOStream(root, outFile);
+    }
+
+    private static void testRemoteStream() throws Exception {
+        ExtendedFile root = remoteFS.getFile(TEST_DIR);
+        ExtendedFile outFile = remoteFS.getFile("/dev/null");
+        testIOStream(root, outFile);
+    }
+
+    private static void testIOStream(ExtendedFile root, ExtendedFile outFile) throws Exception {
+        OutputStream out = outFile.newOutputStream();
+        byte[] buf = new byte[BUFFER_SIZE];
+        callback = file -> {
+            Log.d(TAG, file.getClass().getSimpleName() + " stream: " + file.getPath());
+            try (InputStream in = file.newInputStream()) {
+                for (;;) {
+                    int read = in.read(buf);
+                    if (read <= 0)
+                        break;
+                    out.write(buf, 0, read);
+                    md.update(buf, 0, read);
+                }
+                out.flush();
+            }
+        };
+        try {
+            traverse(root);
+        } finally {
+            out.close();
+        }
+    }
+
+    private static void testShellRandomIO() throws Exception {
+        SuFile root = new SuFile(TEST_DIR);
+
+        OutputStream out = new SuFile("/dev/null").newOutputStream();
+        byte[] buf = new byte[BUFFER_SIZE];
+        callback = file -> {
+            Log.d(TAG, "SuRandomAccessFile: " + file.getPath());
+            try (SuRandomAccessFile in = SuRandomAccessFile.open(file, "r")) {
+                for (;;) {
+                    // Randomize read/write length to test unaligned I/O
+                    int len = r.nextInt(buf.length);
+                    int read = in.read(buf, 0, len);
+                    if (read <= 0)
+                        break;
+                    out.write(buf, 0, read);
+                    md.update(buf, 0, read);
+                }
+                out.flush();
+            }
+        };
+        try {
+            traverse(root);
+        } finally {
+            out.close();
+        }
+    }
+
+    private static void testRemoteChannel() throws Exception {
+        ExtendedFile root = remoteFS.getFile(TEST_DIR);
+
+        FileChannel out = remoteFS.openChannel("/dev/null", MODE_WRITE_ONLY);
+        ByteBuffer buf = ByteBuffer.allocateDirect(BUFFER_SIZE);
+        callback = file -> {
+            Log.d(TAG, "RemoteFileChannel: " + file.getPath());
+            try (FileChannel src = remoteFS.openChannel(file, MODE_READ_ONLY)) {
+                for (;;) {
+                    // Randomize read/write length
+                    int len = r.nextInt(buf.capacity());
+                    buf.limit(len);
+                    if (src.read(buf) <= 0)
+                        break;
+                    buf.flip();
+                    out.write(buf);
+                    buf.rewind();
+                    md.update(buf);
+                    buf.clear();
+                }
+            }
+        };
+        try {
+            traverse(root);
+        } finally {
+            out.close();
+        }
+    }
+
+    private static void verifyHash(ExtendedFile file) {
+        if (hashes == null)
+            return;
+        byte[] refHash = hashes.get(file.getPath());
+        if (refHash == null) {
+            Log.e(TAG, "ref hash is null: " + file.getPath());
+        } else if (!Arrays.equals(refHash, md.digest())) {
+            Log.e(TAG, file.getClass().getSimpleName() +
+                    " hash mismatch: " + file.getPath());
+        }
+    }
+
+    private static void traverse(ExtendedFile file) throws Exception {
+        if (file.isSymlink())
+            return;
+        if (file.isDirectory()) {
+            ExtendedFile[] ls = file.listFiles();
             if (ls == null)
                 return;
-            for (SuFile file : ls) {
-                traverse(file);
+            for (ExtendedFile child : ls) {
+                traverse(child);
             }
         } else {
-            callback.onFile(base);
+            md.reset();
+            callback.onFile(file);
+            verifyHash(file);
         }
     }
 
-    public static void pump(InputStream in) throws IOException {
-        Random r = new Random();
-        for (;;) {
-            // Randomize read/write length to test unaligned I/O
-            int len = r.nextInt(buf.length);
-            int read = in.read(buf, 0, len);
-            if (read <= 0)
-                break;
-            out.write(buf, 0, read);
-        }
-        out.flush();
-    }
 }

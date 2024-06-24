@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 John "topjohnwu" Wu
+ * Copyright 2024 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,10 @@
 
 package com.topjohnwu.superuser.internal;
 
+import static com.topjohnwu.superuser.Shell.EXECUTOR;
+import static com.topjohnwu.superuser.Shell.GetShellCallback;
+
+import androidx.annotation.GuardedBy;
 import androidx.annotation.RestrictTo;
 
 import com.topjohnwu.superuser.NoShellException;
@@ -24,15 +28,16 @@ import com.topjohnwu.superuser.Shell;
 import java.io.InputStream;
 import java.util.concurrent.Executor;
 
-import static com.topjohnwu.superuser.Shell.EXECUTOR;
-import static com.topjohnwu.superuser.Shell.GetShellCallback;
-
 @RestrictTo(RestrictTo.Scope.LIBRARY)
 public final class MainShell {
 
+    @GuardedBy("self")
+    private static final ShellImpl[] mainShell = new ShellImpl[1];
+
+    @GuardedBy("class")
     private static boolean isInitMain;
-    private static ShellImpl mainShell;
-    private static BuilderImpl defaultBuilder;
+    @GuardedBy("class")
+    private static BuilderImpl mainBuilder;
 
     private MainShell() {}
 
@@ -40,67 +45,68 @@ public final class MainShell {
         ShellImpl shell = getCached();
         if (shell == null) {
             isInitMain = true;
-            shell = getBuilder().build();
+            if (mainBuilder == null)
+                mainBuilder = new BuilderImpl();
+            shell = mainBuilder.build();
             isInitMain = false;
         }
         return shell;
     }
 
+    private static void returnShell(Shell s, Executor e, GetShellCallback cb) {
+        if (e == null)
+            cb.onShell(s);
+        else
+            e.execute(() -> cb.onShell(s));
+    }
+
     public static void get(Executor executor, GetShellCallback callback) {
         Shell shell = getCached();
         if (shell != null) {
-            if (executor == null)
-                callback.onShell(shell);
-            else
-                executor.execute(() -> callback.onShell(shell));
+            returnShell(shell, executor, callback);
         } else {
             // Else we get shell in worker thread and call the callback when we get a Shell
             EXECUTOR.execute(() -> {
-                Shell s;
                 try {
-                    synchronized (MainShell.class) {
-                        isInitMain = true;
-                        s = getBuilder().build();
-                        isInitMain = false;
-                    }
+                    returnShell(get(), executor, callback);
                 } catch (NoShellException e) {
                     Utils.ex(e);
-                    return;
                 }
-                if (executor == null)
-                    callback.onShell(s);
-                else
-                    executor.execute(() -> callback.onShell(s));
             });
         }
     }
 
-    public static synchronized ShellImpl getCached() {
-        if (mainShell != null && mainShell.getStatus() < 0)
-            mainShell = null;
-        return mainShell;
+    public static ShellImpl getCached() {
+        synchronized (mainShell) {
+            ShellImpl s = mainShell[0];
+            if (s != null && s.getStatus() < 0) {
+                s = null;
+                mainShell[0] = null;
+            }
+            return s;
+        }
     }
 
-    static synchronized void set(ShellImpl shell) {
-        if (isInitMain)
-            mainShell = shell;
+    static synchronized void setCached(ShellImpl shell) {
+        if (isInitMain) {
+            synchronized (mainShell) {
+                mainShell[0] = shell;
+            }
+        }
     }
 
     public static synchronized void setBuilder(Shell.Builder builder) {
-        defaultBuilder = (BuilderImpl) builder;
+        if (isInitMain || getCached() != null) {
+            throw new IllegalStateException("The main shell was already created");
+        }
+        mainBuilder = (BuilderImpl) builder;
     }
 
-    private static BuilderImpl getBuilder() {
-        if (defaultBuilder == null)
-            defaultBuilder = new BuilderImpl();
-        return defaultBuilder;
+    public static Shell.Job newJob(InputStream in) {
+        return new PendingJob().add(in);
     }
 
-    public static Shell.Job newJob(boolean su, InputStream in) {
-        return new PendingJob(su).add(in);
-    }
-
-    public static Shell.Job newJob(boolean su, String... cmds) {
-        return new PendingJob(su).add(cmds);
+    public static Shell.Job newJob(String... cmds) {
+        return new PendingJob().add(cmds);
     }
 }

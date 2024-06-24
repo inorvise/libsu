@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 John "topjohnwu" Wu
+ * Copyright 2024 John "topjohnwu" Wu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,16 @@
 
 package com.topjohnwu.superuser.internal;
 
+import static com.topjohnwu.superuser.internal.JobTask.END_UUID;
+import static com.topjohnwu.superuser.internal.JobTask.UUID_LEN;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.List;
 import java.util.concurrent.Callable;
-
-import static com.topjohnwu.superuser.internal.TaskImpl.END_UUID;
-import static com.topjohnwu.superuser.internal.TaskImpl.UUID_LEN;
-import static com.topjohnwu.superuser.internal.Utils.UTF_8;
 
 abstract class StreamGobbler<T> implements Callable<T> {
 
@@ -74,9 +74,11 @@ abstract class StreamGobbler<T> implements Callable<T> {
 
         @Override
         public Integer call() throws Exception {
-            String code = process(true);
+            String codeStr = process(true);
             try {
-                return code == null ? NO_RESULT_CODE : Integer.parseInt(code);
+                int code = codeStr == null ? NO_RESULT_CODE : Integer.parseInt(codeStr);
+                Utils.log(TAG, "(exit code: " + code + ")");
+                return code;
             } catch (NumberFormatException e) {
                 return NO_RESULT_CODE;
             }
